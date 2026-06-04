@@ -2835,17 +2835,92 @@ func collectFiles(fs fsys.FS, base, prefix string, out *[]string) {
 	}
 }
 
+// alwaysIgnoredRuntimeDirs names directories excluded from the config-content
+// revision hash (collectFiles / PackContentHashRecursive) and the controller's
+// recursive fsnotify watcher (cmd/gc/controller.go shouldIgnoreConfigWatchEvent)
+// wherever they appear in a path. These are dependency/build/cache trees and
+// runtime dot-dirs that never contain config: node_modules, vendor, dist,
+// __pycache__, the VCS/cache dirs .git/.cache, the gc/beads runtime dirs
+// .gc/.beads, the Python venv .venv, and the JS toolchain caches
+// .next/.nuxt/.turbo/.bun. Their names are distinctive enough that a real
+// config tree never legitimately nests one (e.g. prompts/node_modules), so
+// matching any path segment is safe and lets nested trees be pruned.
+//
+// Pruning these from the watcher is load-bearing on macOS: the recursive
+// fsnotify watcher costs one kqueue file descriptor per watched directory, so a
+// single un-pruned node_modules can exhaust the supervisor's FD budget (~51k
+// FDs observed in gastownhall/gascity#2954).
+var alwaysIgnoredRuntimeDirs = map[string]struct{}{
+	".gc":          {},
+	".beads":       {},
+	"node_modules": {},
+	".git":         {},
+	".cache":       {},
+	"dist":         {},
+	"vendor":       {},
+	".next":        {},
+	".nuxt":        {},
+	".turbo":       {},
+	".bun":         {},
+	".venv":        {},
+	"__pycache__":  {},
+}
+
+// topLevelIgnoredRuntimeDirs names runtime dirs that are excluded only when they
+// sit at the top level (relative to a pack root for the hasher, or directly
+// under a watched root for the watcher). Their names are generic words that may
+// legitimately appear deeper in a config tree (e.g. prompts/state/example.md is
+// real config), so matching them anywhere would over-prune — and for the
+// watcher, absolute paths routinely contain a "tmp" segment (/tmp/...).
+var topLevelIgnoredRuntimeDirs = map[string]struct{}{
+	"state": {},
+	"tmp":   {},
+}
+
+// IgnoredRuntimeDirNames returns every directory name excluded from config
+// watching and revision hashing (both the always-ignored and top-level-only
+// sets). It is the single source of truth the cmd/gc controller's fsnotify
+// watcher consumes so the watcher and hasher exclusion lists can never drift.
+// The returned slice is a fresh copy; callers may sort or retain it.
+func IgnoredRuntimeDirNames() []string {
+	out := make([]string, 0, len(alwaysIgnoredRuntimeDirs)+len(topLevelIgnoredRuntimeDirs))
+	for name := range alwaysIgnoredRuntimeDirs {
+		out = append(out, name)
+	}
+	for name := range topLevelIgnoredRuntimeDirs {
+		out = append(out, name)
+	}
+	return out
+}
+
+// IsAlwaysIgnoredRuntimeDir reports whether name is a directory excluded
+// wherever it appears in a path. Exported for the cmd/gc fsnotify watcher.
+func IsAlwaysIgnoredRuntimeDir(name string) bool {
+	_, ok := alwaysIgnoredRuntimeDirs[name]
+	return ok
+}
+
+// IsTopLevelIgnoredRuntimeDir reports whether name is a runtime dir excluded
+// only at the top level of a watched/pack root. Exported for the cmd/gc
+// fsnotify watcher.
+func IsTopLevelIgnoredRuntimeDir(name string) bool {
+	_, ok := topLevelIgnoredRuntimeDirs[name]
+	return ok
+}
+
 func isIgnoredPackRuntimePath(path string) bool {
 	parts := strings.FieldsFunc(filepath.ToSlash(path), func(r rune) bool { return r == '/' })
 	if len(parts) == 0 {
 		return false
 	}
-	switch parts[0] {
-	case ".beads", ".cache", ".gc", ".git", "state", "tmp":
+	// Generic runtime dirs (state, tmp) only count at the pack-relative top
+	// level; matching them deeper would prune real config (e.g. prompts/state).
+	if _, ok := topLevelIgnoredRuntimeDirs[parts[0]]; ok {
 		return true
 	}
+	// Distinctive dependency/build/cache dirs are pruned at any depth.
 	for _, part := range parts {
-		if part == "__pycache__" {
+		if _, ok := alwaysIgnoredRuntimeDirs[part]; ok {
 			return true
 		}
 	}

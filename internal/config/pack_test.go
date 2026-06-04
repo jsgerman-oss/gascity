@@ -5347,3 +5347,114 @@ func TestMergeHoistedCityNamedSessions_DedupAcrossBindings(t *testing.T) {
 		t.Errorf("first-occurrence-wins: BindingName = %q, want %q", merged[0].BindingName, "gastown")
 	}
 }
+
+// TestIsIgnoredPackRuntimePath pins the directory-exclusion set shared by the
+// revision hasher and the controller's recursive fsnotify watcher
+// (gastownhall/gascity#2954). node_modules and other dependency/build/cache
+// trees must be ignored both at the top level and when nested, so a pack that
+// ships a JS toolchain does not pull thousands of files into the content hash
+// (and, via the mirror list in cmd/gc, into the kqueue watch set).
+func TestIsIgnoredPackRuntimePath(t *testing.T) {
+	ignored := []string{
+		"node_modules",
+		"node_modules/foo",
+		"agents/bar/node_modules",
+		"agents/bar/node_modules/dep/index.js",
+		".git",
+		".git/objects/ab/cdef",
+		".gc",
+		".gc/runtime/trace.log",
+		".beads",
+		".cache/build",
+		"dist/bundle.js",
+		"vendor/github.com/x/y.go",
+		".next/server",
+		".nuxt/dist",
+		".turbo/cache",
+		".bun/install",
+		".venv/lib/python",
+		"state/db.sqlite",
+		"tmp/scratch",
+		"src/__pycache__/mod.cpython-311.pyc",
+	}
+	for _, p := range ignored {
+		if !isIgnoredPackRuntimePath(p) {
+			t.Errorf("isIgnoredPackRuntimePath(%q) = false, want true", p)
+		}
+	}
+
+	allowed := []string{
+		"city.toml",
+		"agents/mayor/prompt.template.md",
+		"packs/foo/topology.toml",
+		"node_modules_helper.go", // not an exact segment match
+		"my-state/file",          // "my-state" != "state"
+		"tmpfile.txt",            // "tmpfile.txt" != "tmp"
+	}
+	for _, p := range allowed {
+		if isIgnoredPackRuntimePath(p) {
+			t.Errorf("isIgnoredPackRuntimePath(%q) = true, want false", p)
+		}
+	}
+}
+
+// TestIgnoredRuntimeDirNamesCoversCriticalDirs guards the single source of
+// truth that both internal/config and the cmd/gc fsnotify watcher consume. If
+// any of these names is dropped, the watcher will re-descend into that tree and
+// the macOS kqueue FD leak from gastownhall/gascity#2954 returns.
+func TestIgnoredRuntimeDirNamesCoversCriticalDirs(t *testing.T) {
+	names := IgnoredRuntimeDirNames()
+	have := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		have[n] = struct{}{}
+	}
+	for _, want := range []string{
+		".gc", ".beads", "node_modules", ".git", ".cache", "dist",
+		"vendor", ".next", ".nuxt", ".turbo", ".bun", ".venv",
+		"state", "tmp", "__pycache__",
+	} {
+		if _, ok := have[want]; !ok {
+			t.Errorf("IgnoredRuntimeDirNames() missing %q", want)
+		}
+	}
+	// The returned slice must be a copy: mutating it must not affect the
+	// canonical set observed by a second call.
+	if len(names) > 0 {
+		names[0] = "MUTATED"
+		for _, n := range IgnoredRuntimeDirNames() {
+			if n == "MUTATED" {
+				t.Fatal("IgnoredRuntimeDirNames() leaked its backing array")
+			}
+		}
+	}
+}
+
+// TestPackContentHashRecursiveExcludesNodeModules verifies the exclusion is
+// effective end-to-end through the revision hasher: adding files under a
+// node_modules subtree must not change a pack's content hash, since those files
+// are never config and dominate dependency-heavy packs.
+func TestPackContentHashRecursiveExcludesNodeModules(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "topology.toml", "name = \"demo\"\n")
+	writeFile(t, dir, "agents/mayor/prompt.template.md", "hello\n")
+
+	before := PackContentHashRecursive(fsys.OSFS{}, dir)
+
+	// Add a dependency tree the watcher/hasher must ignore.
+	writeFile(t, dir, "node_modules/left-pad/index.js", "module.exports = 1\n")
+	writeFile(t, dir, "node_modules/left-pad/package.json", "{\"name\":\"left-pad\"}\n")
+	writeFile(t, dir, "agents/mayor/node_modules/dep/a.js", "nested\n")
+	writeFile(t, dir, ".git/HEAD", "ref: refs/heads/main\n")
+
+	after := PackContentHashRecursive(fsys.OSFS{}, dir)
+	if before != after {
+		t.Fatalf("content hash changed after adding ignored trees: before=%s after=%s", before, after)
+	}
+
+	// A real config change must still move the hash (sanity: exclusion is not
+	// swallowing legitimate edits).
+	writeFile(t, dir, "agents/mayor/prompt.template.md", "changed\n")
+	if changed := PackContentHashRecursive(fsys.OSFS{}, dir); changed == after {
+		t.Fatal("content hash did not change after editing a real config file")
+	}
+}

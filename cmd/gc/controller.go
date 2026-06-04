@@ -630,7 +630,7 @@ func (r *configWatchRegistrar) addPath(root string, recursive bool, done <-chan 
 		if samePath(path, root) {
 			return nil
 		}
-		if path != root && shouldIgnoreConfigWatchEvent(path) {
+		if path != root && shouldPruneWatchChild(walkRoot, path) {
 			return filepath.SkipDir
 		}
 		r.addOne(path, done)
@@ -831,19 +831,57 @@ func watchConfigTargets(targets []config.WatchTarget, dirty *atomic.Bool, pokeCh
 	}
 }
 
+// shouldIgnoreConfigWatchEvent reports whether a path should be excluded from
+// the recursive config watcher because it lives inside a runtime/dependency
+// tree we never load as config. It matches the "always ignored" runtime dir
+// names (config.IsAlwaysIgnoredRuntimeDir: node_modules, .git, .cache, dist,
+// vendor, the gc/beads runtime dirs, the Python venv, and the JS toolchain
+// caches) as any path segment, so nested trees like agents/foo/node_modules are
+// caught regardless of where they sit.
+//
+// Pruning these is load-bearing on macOS: the recursive fsnotify watcher costs
+// one kqueue file descriptor per watched directory, so a single un-pruned
+// node_modules can exhaust the supervisor's FD budget (~51k FDs observed in
+// gastownhall/gascity#2954). The WalkDir in (*configWatchRegistrar).addPath
+// returns filepath.SkipDir for any matched directory, pruning the whole subtree
+// instead of watching it and ignoring events per-write.
+//
+// The generic top-level runtime dirs (state, tmp) are deliberately NOT matched
+// here: a "tmp" segment appears in nearly every absolute path on macOS
+// (/var/folders/.../tmp, /tmp/...) and a rig could legitimately live under a
+// path containing "state". Those are pruned only when they sit directly under a
+// walked root, via shouldPruneWatchChild below where the root is known.
 func shouldIgnoreConfigWatchEvent(path string) bool {
 	clean := filepath.Clean(path)
 	if clean == "" || clean == "." {
 		return false
 	}
-	sepGC := string(filepath.Separator) + ".gc"
-	sepBeads := string(filepath.Separator) + ".beads"
-	return clean == ".gc" ||
-		clean == ".beads" ||
-		strings.HasSuffix(clean, sepGC) ||
-		strings.HasSuffix(clean, sepBeads) ||
-		strings.Contains(clean, sepGC+string(filepath.Separator)) ||
-		strings.Contains(clean, sepBeads+string(filepath.Separator))
+	for _, segment := range strings.Split(filepath.ToSlash(clean), "/") {
+		if segment == "" {
+			continue
+		}
+		if config.IsAlwaysIgnoredRuntimeDir(segment) {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldPruneWatchChild reports whether the directory at path (a descendant of
+// root being walked for recursive watching) should be pruned. It applies the
+// always-ignored exclusions at any depth and, additionally, the generic
+// top-level runtime dirs (state, tmp) when they are a direct child of root.
+// Because root is known here, the generic names can be matched safely without
+// the false positives that an absolute-path-wide match would cause.
+func shouldPruneWatchChild(root, path string) bool {
+	if shouldIgnoreConfigWatchEvent(path) {
+		return true
+	}
+	if base := filepath.Base(path); config.IsTopLevelIgnoredRuntimeDir(base) &&
+		samePath(filepath.Dir(path), root) {
+		return true
+	}
+	return false
 }
 
 // reloadResult holds the result of a config reload attempt.

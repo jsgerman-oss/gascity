@@ -913,6 +913,157 @@ func TestWatchConfigDirs_CityRootIgnoresRuntimeTraceWrites(t *testing.T) {
 	}
 }
 
+// TestShouldIgnoreConfigWatchEvent_DependencyTrees pins the watcher exclusion
+// set that fixes gastownhall/gascity#2954: the recursive fsnotify/kqueue watcher
+// must skip node_modules and other dependency/build/cache trees (one kqueue FD
+// per watched dir on macOS), both at a rig root and when nested. The generic
+// names state/tmp are intentionally NOT matched by this absolute-path predicate
+// (every macOS temp path contains a "tmp" segment); they are pruned root-locally
+// by shouldPruneWatchChild instead — see TestShouldPruneWatchChild below.
+func TestShouldIgnoreConfigWatchEvent_DependencyTrees(t *testing.T) {
+	root := t.TempDir()
+	ignored := []string{
+		filepath.Join(root, "node_modules"),
+		filepath.Join(root, "node_modules", "left-pad"),
+		filepath.Join(root, "agents", "mayor", "node_modules", "dep"),
+		filepath.Join(root, ".git"),
+		filepath.Join(root, ".git", "objects"),
+		filepath.Join(root, ".cache"),
+		filepath.Join(root, "dist"),
+		filepath.Join(root, "vendor", "x"),
+		filepath.Join(root, ".next"),
+		filepath.Join(root, ".nuxt"),
+		filepath.Join(root, ".turbo"),
+		filepath.Join(root, ".bun"),
+		filepath.Join(root, ".venv", "lib"),
+		filepath.Join(root, "src", "__pycache__"),
+		filepath.Join(root, ".gc", "runtime"),
+		filepath.Join(root, ".beads"),
+	}
+	for _, p := range ignored {
+		if !shouldIgnoreConfigWatchEvent(p) {
+			t.Errorf("shouldIgnoreConfigWatchEvent(%q) = false, want true", p)
+		}
+	}
+
+	allowed := []string{
+		filepath.Join(root, "city.toml"),
+		filepath.Join(root, "agents", "mayor", "prompt.template.md"),
+		filepath.Join(root, "my-state", "file"), // not the "state" segment
+		filepath.Join(root, "tmpfile.txt"),      // not the "tmp" segment
+		// state/tmp must NOT be matched by the absolute-path predicate.
+		filepath.Join(root, "state"),
+		filepath.Join(root, "tmp", "scratch"),
+	}
+	for _, p := range allowed {
+		if shouldIgnoreConfigWatchEvent(p) {
+			t.Errorf("shouldIgnoreConfigWatchEvent(%q) = true, want false", p)
+		}
+	}
+}
+
+// TestShouldPruneWatchChild covers the root-aware pruning that handles the
+// generic runtime dirs (state, tmp) without the false positives a path-wide
+// match would cause: they are pruned only as a direct child of the walked root,
+// while the always-ignored trees are pruned at any depth.
+func TestShouldPruneWatchChild(t *testing.T) {
+	root := t.TempDir()
+
+	prune := []string{
+		filepath.Join(root, "state"),                       // top-level generic runtime dir
+		filepath.Join(root, "tmp"),                         // top-level generic runtime dir
+		filepath.Join(root, "node_modules"),                // always-ignored, top level
+		filepath.Join(root, "agents", "x", "node_modules"), // always-ignored, nested
+		filepath.Join(root, ".git"),
+	}
+	for _, p := range prune {
+		if !shouldPruneWatchChild(root, p) {
+			t.Errorf("shouldPruneWatchChild(root, %q) = false, want true", p)
+		}
+	}
+
+	keep := []string{
+		filepath.Join(root, "agents"),
+		filepath.Join(root, "agents", "mayor"),
+		// "state"/"tmp" deeper than a direct child of root are real config dirs.
+		filepath.Join(root, "prompts", "state"),
+		filepath.Join(root, "agents", "tmp"),
+	}
+	for _, p := range keep {
+		if shouldPruneWatchChild(root, p) {
+			t.Errorf("shouldPruneWatchChild(root, %q) = true, want false", p)
+		}
+	}
+}
+
+// TestWatchConfigDirs_DependencyTreesNotWatched is the behavioral counterpart:
+// a node_modules tree pre-existing under a recursive watch root must not be
+// registered as a watch target, so writes inside it never fire markDirty().
+// A write to a real config file under the same root must still poke, proving the
+// pruning is scoped to the dependency subtree.
+func TestWatchConfigDirs_DependencyTreesNotWatched(t *testing.T) {
+	old := debounceDelay
+	debounceDelay = 5 * time.Millisecond
+	t.Cleanup(func() { debounceDelay = old })
+
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agents", "mayor")
+	nmDir := filepath.Join(agentDir, "node_modules", "left-pad")
+	if err := os.MkdirAll(nmDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll node_modules dir: %v", err)
+	}
+	nmFile := filepath.Join(nmDir, "index.js")
+	if err := os.WriteFile(nmFile, []byte("module.exports = 1\n"), 0o644); err != nil {
+		t.Fatalf("seed node_modules file: %v", err)
+	}
+	promptPath := filepath.Join(agentDir, "prompt.template.md")
+	if err := os.WriteFile(promptPath, []byte("original\n"), 0o644); err != nil {
+		t.Fatalf("seed prompt: %v", err)
+	}
+
+	var dirty atomic.Bool
+	pokeCh := make(chan struct{}, 1)
+	var stderr bytes.Buffer
+	cleanup := watchConfigTargets([]config.WatchTarget{{Path: dir, Recursive: true}}, &dirty, pokeCh, &stderr)
+	defer cleanup()
+
+	// Drain any startup poke.
+	select {
+	case <-pokeCh:
+	default:
+	}
+	dirty.Store(false)
+
+	// Writes inside node_modules must be ignored (the subtree is pruned).
+	for i, body := range []string{"second\n", "third\n"} {
+		if err := os.WriteFile(nmFile, []byte(body), 0o644); err != nil {
+			t.Fatalf("rewrite node_modules file #%d: %v", i+1, err)
+		}
+		select {
+		case <-pokeCh:
+			t.Fatalf("unexpected watcher poke after node_modules write #%d; stderr=%q", i+1, stderr.String())
+		case <-time.After(250 * time.Millisecond):
+		}
+		if dirty.Load() {
+			t.Fatalf("dirty flag set after node_modules write #%d; stderr=%q", i+1, stderr.String())
+		}
+	}
+
+	// Positive control: a real config edit under the same root must poke.
+	dirty.Store(false)
+	if err := os.WriteFile(promptPath, []byte("edited\n"), 0o644); err != nil {
+		t.Fatalf("rewrite prompt: %v", err)
+	}
+	select {
+	case <-pokeCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for watcher poke after real config edit; stderr=%q", stderr.String())
+	}
+	if !dirty.Load() {
+		t.Fatalf("dirty flag not set after real config edit; stderr=%q", stderr.String())
+	}
+}
+
 func TestWatchConfigDirs_SymlinkSeedDirWatchesNestedPreExistingDir(t *testing.T) {
 	old := debounceDelay
 	debounceDelay = 5 * time.Millisecond
