@@ -7658,6 +7658,257 @@ func TestOrderDispatchSingleFlightLockFailsClosedOnPartialTierError(t *testing.T
 	}
 }
 
+// --- #2893: per-node bd-walk replaced by an in-memory snapshot walk ---
+//
+// storeHasOpenDescendants spawned one `bd list --parent <id>` subprocess per
+// subtree node. In production each such call is a synchronous `bd` spawn
+// (internal/beads/bdstore.go listViaBDList appends --parent), so under Dolt
+// write contention a single heavy order's gate blocked the dispatch goroutine
+// for minutes and scheduled orders stopped firing. The fix walks ONE
+// cache-served active snapshot in memory; the bd-walk survives only as the
+// cache-miss / ambiguous-topology fallback.
+
+// perNodeListCounter wraps a Store and counts List calls that carry a ParentID
+// — the 1:1 proxy for the production `bd list --parent` subprocess that
+// storeHasOpenDescendants fires per subtree node. A warm-cache gate must make
+// ZERO of these.
+type perNodeListCounter struct {
+	beads.Store
+	mu          sync.Mutex
+	parentLists int
+}
+
+func (s *perNodeListCounter) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.ParentID != "" {
+		s.mu.Lock()
+		s.parentLists++
+		s.mu.Unlock()
+	}
+	return s.Store.List(query)
+}
+
+func (s *perNodeListCounter) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.parentLists
+}
+
+// TestHasOpenWorkStrictWarmCacheMakesZeroPerNodeListCalls is the core #2893
+// regression: with a primed cache the single-flight gate resolves a wisp's
+// open descendants from the in-memory snapshot and never issues a per-node
+// (ParentID) List — i.e. zero `bd list --parent` subprocesses.
+func TestHasOpenWorkStrictWarmCacheMakesZeroPerNodeListCalls(t *testing.T) {
+	backing := &perNodeListCounter{Store: beads.NewMemStore()}
+	root, err := backing.Create(beads.Bead{
+		Title:  "order:digest wisp",
+		Type:   "molecule",
+		Labels: []string{"order-run:digest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An open step under the root. It carries gc.root_bead_id (as
+	// molecule.Instantiate stamps on graph/kind steps) AND is a direct child,
+	// so either snapshot signal proves the open descendant without a subprocess.
+	if _, err := backing.Create(beads.Bead{
+		Title:    "digest step",
+		Type:     "step",
+		Status:   "in_progress",
+		ParentID: root.ID,
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	store := beads.NewCachingStoreForTest(backing, nil)
+	if err := store.PrimeActive(); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+	before := backing.count()
+
+	m := &memoryOrderDispatcher{}
+	hasOpen, err := m.hasOpenWorkStrict(store, "digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasOpen {
+		t.Fatal("gate missed an open wisp step; would re-dispatch a duplicate wisp")
+	}
+	// The descendant here is in_progress (not "open"), so this also pins that
+	// in_progress steps count as in-flight wisp work (tr-kds01).
+	if got := backing.count() - before; got != 0 {
+		t.Fatalf("warm-cache gate made %d per-node (ParentID) List calls, want 0 — #2893 bd-walk was not bypassed", got)
+	}
+}
+
+// TestHasOpenWorkStrictWarmCacheOpenGrandchildUnderClosedChild pins the hardest
+// correctness guard from the warm path: a CLOSED intermediate node with an OPEN
+// grandchild must still read TRUE. The closed intermediate is absent from the
+// active snapshot, so the gate proves the descendant via the grandchild's
+// gc.root_bead_id stamp — no subprocess, no false negative (ga-jra/tr-kds01).
+func TestHasOpenWorkStrictWarmCacheOpenGrandchildUnderClosedChild(t *testing.T) {
+	backing := &perNodeListCounter{Store: beads.NewMemStore()}
+	root, _ := backing.Create(beads.Bead{
+		Title:  "order:nested wisp",
+		Type:   "molecule",
+		Labels: []string{"order-run:nested"},
+	})
+	intermediate, _ := backing.Create(beads.Bead{
+		Title:    "intermediate step",
+		Type:     "step",
+		ParentID: root.ID,
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	grandchild, _ := backing.Create(beads.Bead{
+		Title:    "open grandchild step",
+		Type:     "step",
+		ParentID: intermediate.ID,
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	// Close the intermediate; the grandchild stays open. Direct-children-only
+	// (or active-adjacency-only) would miss the grandchild now that its parent
+	// is absent from the active snapshot.
+	if err := backing.Close(intermediate.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = grandchild
+
+	store := beads.NewCachingStoreForTest(backing, nil)
+	if err := store.PrimeActive(); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+	before := backing.count()
+
+	m := &memoryOrderDispatcher{}
+	hasOpen, err := m.hasOpenWorkStrict(store, "nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasOpen {
+		t.Fatal("gate missed open grandchild under a closed intermediate; would re-dispatch a duplicate wisp")
+	}
+	if got := backing.count() - before; got != 0 {
+		t.Fatalf("gate made %d per-node List calls resolving a stamped grandchild, want 0", got)
+	}
+}
+
+// TestHasOpenWorkStrictWarmCacheOrphanAllClosedIsFalse pins the matching
+// no-false-positive guard: an orphan wisp root whose every descendant is closed
+// must read FALSE, or re-dispatch is permanently blocked (the ga-jra/ga-lo8c
+// restart stall). Resolved from the snapshot with no subprocess.
+func TestHasOpenWorkStrictWarmCacheOrphanAllClosedIsFalse(t *testing.T) {
+	backing := &perNodeListCounter{Store: beads.NewMemStore()}
+	root, _ := backing.Create(beads.Bead{
+		Title:  "order:orphan wisp",
+		Type:   "molecule",
+		Labels: []string{"order-run:orphan"},
+	})
+	child, _ := backing.Create(beads.Bead{
+		Title:    "completed step",
+		Type:     "step",
+		ParentID: root.ID,
+		Metadata: map[string]string{"gc.root_bead_id": root.ID},
+	})
+	if err := backing.Close(child.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Root itself is left open (orphan molecule root that never auto-closed).
+
+	store := beads.NewCachingStoreForTest(backing, nil)
+	if err := store.PrimeActive(); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+	before := backing.count()
+
+	m := &memoryOrderDispatcher{}
+	hasOpen, err := m.hasOpenWorkStrict(store, "orphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasOpen {
+		t.Fatal("gate counted an all-closed orphan wisp as open; would permanently block re-dispatch (ga-jra/ga-lo8c)")
+	}
+	if got := backing.count() - before; got != 0 {
+		t.Fatalf("all-closed orphan gate made %d per-node List calls, want 0", got)
+	}
+}
+
+// TestHasOpenWorkStrictColdCacheFallsBackToBDWalk verifies the fallback: with
+// no cache (a plain store lacking CachedList), the gate uses the authoritative
+// per-node walk and is still correct. The store records the per-node (ParentID)
+// List calls to prove the bd-walk path actually ran.
+func TestHasOpenWorkStrictColdCacheFallsBackToBDWalk(t *testing.T) {
+	backing := &perNodeListCounter{Store: beads.NewMemStore()}
+	root, _ := backing.Create(beads.Bead{
+		Title:  "order:cold wisp",
+		Type:   "molecule",
+		Labels: []string{"order-run:cold"},
+	})
+	// Legacy-style step with NO gc.root_bead_id stamp: only the ParentID-walk
+	// fallback can attribute it to the root.
+	if _, err := backing.Create(beads.Bead{
+		Title:    "unstamped open step",
+		Type:     "step",
+		Status:   "open",
+		ParentID: root.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// perNodeListCounter does not implement CachedList, so the resolver cannot
+	// take a cache-served snapshot and must fall back to storeHasOpenDescendants.
+	m := &memoryOrderDispatcher{}
+	hasOpen, err := m.hasOpenWorkStrict(backing, "cold")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasOpen {
+		t.Fatal("cold-cache fallback missed the open step; would re-dispatch a duplicate wisp")
+	}
+	if backing.count() == 0 {
+		t.Fatal("expected the per-node bd-walk fallback to issue ParentID List calls when no cache is available")
+	}
+}
+
+// TestHasOpenWorkStrictColdCachingStoreFallsBackThroughCachedList verifies the
+// fallback through a real CachingStore whose cache is NOT primed (the common
+// just-restarted controller state). CachedList returns ok=false for an
+// uninitialized cache, so the gate must fall back to the bd-walk and still
+// report the open descendant correctly — even for a legacy step with no
+// gc.root_bead_id stamp that only the ParentID walk can attribute to the root.
+func TestHasOpenWorkStrictColdCachingStoreFallsBackThroughCachedList(t *testing.T) {
+	backing := &perNodeListCounter{Store: beads.NewMemStore()}
+	root, _ := backing.Create(beads.Bead{
+		Title:  "order:cold-cache wisp",
+		Type:   "molecule",
+		Labels: []string{"order-run:cold-cache"},
+	})
+	if _, err := backing.Create(beads.Bead{
+		Title:    "unstamped open step",
+		Type:     "step",
+		Status:   "open",
+		ParentID: root.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No PrimeActive: the cache is uninitialized, so CachedList yields ok=false.
+	store := beads.NewCachingStoreForTest(backing, nil)
+
+	before := backing.count()
+	m := &memoryOrderDispatcher{}
+	hasOpen, err := m.hasOpenWorkStrict(store, "cold-cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasOpen {
+		t.Fatal("cold CachingStore gate missed the open step; unprimed cache must fall back to the bd-walk")
+	}
+	if backing.count()-before == 0 {
+		t.Fatal("expected an unprimed CachingStore to fall back to the per-node bd-walk (ParentID List calls)")
+	}
+}
+
 // --- dispatch() store-handle close regression tests (ga-anio6p) ---
 //
 // dispatch() must close every store handle it opens each pass via

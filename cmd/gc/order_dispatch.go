@@ -1397,6 +1397,10 @@ func (m *memoryOrderDispatcher) hasOpenWorkStrict(store beads.Store, scopedName 
 	if err != nil {
 		return false, fmt.Errorf("listing order work beads: %w", err)
 	}
+	// openDescendants resolves the per-wisp open-descendant question. It is
+	// memoized so the (potentially cache-served) active snapshot is built at
+	// most once per gate call, then reused across every candidate root.
+	snap := newOpenDescendantResolver(store)
 	for _, b := range results {
 		if b.Status == "closed" {
 			continue
@@ -1410,13 +1414,158 @@ func (m *memoryOrderDispatcher) hasOpenWorkStrict(store beads.Store, scopedName 
 		if isOrderRootOnlyWispCandidate(b) {
 			return true, nil
 		}
-		hasOpenDescendants, err := storeHasOpenDescendants(store, b.ID)
+		hasOpenDescendants, err := snap.hasOpenDescendants(b.ID)
 		if err != nil {
 			return false, fmt.Errorf("checking open descendants of wisp %s: %w", b.ID, err)
 		}
 		if hasOpenDescendants {
 			return true, nil
 		}
+	}
+	return false, nil
+}
+
+// openDescendantResolver answers "does this wisp root have a non-closed
+// transitive descendant?" for the single-flight gate. It prefers a single
+// cache-served snapshot of the store's ACTIVE beads (open + in_progress) and
+// walks that snapshot in memory — zero subprocesses when the cache is warm —
+// and only falls back to the per-node `bd list` walk (storeHasOpenDescendants)
+// when the snapshot cannot prove an answer (cold/dirty cache, no cache, or an
+// active bead whose lineage is hidden behind a closed/absent ancestor).
+//
+// This is the fix for gastownhall/gascity#2893: storeHasOpenDescendants spawned
+// one `bd list --parent` subprocess per subtree node, so under Dolt write
+// contention a single heavy order's gate blocked the dispatch goroutine for
+// minutes and later orders (feeders) never ticked.
+type openDescendantResolver struct {
+	store beads.Store
+	// snapshot caches the active-bead snapshot keyed by parent ID, plus a
+	// set of bead IDs that are present in the snapshot, plus the set of root
+	// IDs proven reachable via gc.root_bead_id. ok reports whether the snapshot
+	// was cache-served (and therefore usable without a subprocess).
+	loaded        bool
+	ok            bool
+	childrenByPar map[string][]beads.Bead
+	presentIDs    map[string]struct{}
+	beadsByRootMD map[string]struct{} // wisp roots that own >=1 active gc.root_bead_id member
+	hasDangling   bool                // an active bead whose lineage is unprovable from the snapshot
+}
+
+// cachedActiveLister is the cache-only read capability openDescendantResolver
+// relies on. CachingStore implements it (CachedList serves active-bead queries
+// without ParentID/IncludeClosed from the in-memory read model); plain stores
+// (e.g. MemStore, BdStore) do not, so they always take the bd-walk fallback —
+// preserving prior behavior exactly for non-cached stores.
+type cachedActiveLister interface {
+	CachedList(beads.ListQuery) ([]beads.Bead, bool)
+}
+
+func newOpenDescendantResolver(store beads.Store) *openDescendantResolver {
+	return &openDescendantResolver{store: store}
+}
+
+// activeSnapshotQuery is the cache-eligible query for the active bead set.
+// CRITICAL: it must NOT set ParentID or IncludeClosed (CachingStore.List /
+// CachedList both MISS the cache for those shapes — caching_store_reads.go), and
+// it must NOT set Status: a "Status: open" filter would drop in_progress steps,
+// which ARE in-flight wisp work (tr-kds01). With no Status and no IncludeClosed,
+// Matches keeps every non-closed bead across both tiers — exactly PrimeActive's
+// open+in_progress read model.
+var activeSnapshotQuery = beads.ListQuery{TierMode: beads.TierBoth, AllowScan: true}
+
+func (r *openDescendantResolver) load() {
+	if r.loaded {
+		return
+	}
+	r.loaded = true
+	cache, ok := r.store.(cachedActiveLister)
+	if !ok {
+		return
+	}
+	items, served := cache.CachedList(activeSnapshotQuery)
+	if !served {
+		return
+	}
+	r.ok = true
+	r.childrenByPar = make(map[string][]beads.Bead, len(items))
+	r.presentIDs = make(map[string]struct{}, len(items))
+	r.beadsByRootMD = make(map[string]struct{})
+	for _, b := range items {
+		if b.ID == "" {
+			continue
+		}
+		r.presentIDs[b.ID] = struct{}{}
+	}
+	for _, b := range items {
+		if b.ID == "" {
+			continue
+		}
+		if b.ParentID != "" {
+			r.childrenByPar[b.ParentID] = append(r.childrenByPar[b.ParentID], b)
+		}
+		if rootID := b.Metadata["gc.root_bead_id"]; rootID != "" && rootID != b.ID {
+			r.beadsByRootMD[rootID] = struct{}{}
+		}
+	}
+	// A "dangling" active bead has a non-empty ParentID that is NOT in the
+	// active snapshot AND carries no gc.root_bead_id stamp. Its true lineage
+	// runs through a closed (and therefore absent) ancestor, so the snapshot
+	// alone cannot prove which root — if any — it descends from. When one
+	// exists, conservative-FALSE is unsafe and we defer to the bd-walk. (A
+	// legacy nested molecule with a closed intermediate and an open,
+	// unstamped grandchild is the canonical case — ga-jra/tr-kds01.)
+	for _, b := range items {
+		if b.ParentID == "" {
+			continue
+		}
+		if _, present := r.presentIDs[b.ParentID]; present {
+			continue
+		}
+		if b.Metadata["gc.root_bead_id"] != "" {
+			continue
+		}
+		r.hasDangling = true
+		break
+	}
+}
+
+// hasOpenDescendants reports whether rootID has any non-closed transitive
+// descendant. It answers from the in-memory snapshot without a subprocess
+// whenever the snapshot can PROVE the answer; otherwise it falls back to the
+// authoritative per-node bd-walk (storeHasOpenDescendants).
+func (r *openDescendantResolver) hasOpenDescendants(rootID string) (bool, error) {
+	r.load()
+	if !r.ok {
+		return storeHasOpenDescendants(r.store, rootID)
+	}
+	// Positive fast path: any active bead stamped with this root in its
+	// gc.root_bead_id metadata is an open descendant. molecule.Instantiate
+	// stamps this on graph-workflow and gc.kind steps (incl. nested ones whose
+	// intermediate parent has since closed), so this proves TRUE even when the
+	// ParentID chain is broken by a closed node.
+	if _, ok := r.beadsByRootMD[rootID]; ok {
+		return true, nil
+	}
+	// Active-adjacency check. The snapshot holds only non-closed beads, so any
+	// active child of rootID is itself an open descendant — this catches legacy
+	// molecule step beads that carry no gc.root_bead_id stamp. A purely
+	// open/in_progress chain that is deeper than one level always surfaces here
+	// too: each of its intermediates is non-closed, so the topmost intermediate
+	// is itself an active direct child of rootID. (A chain broken by a CLOSED
+	// intermediate is handled above via gc.root_bead_id, or below via the
+	// dangling-bead fallback.)
+	for _, c := range r.childrenByPar[rootID] {
+		if c.ID == "" {
+			continue
+		}
+		return true, nil
+	}
+	// Neither signal found open work under rootID. Returning FALSE is only safe
+	// if the snapshot is provably complete for descendant reachability. A
+	// dangling active bead (hidden behind a closed ancestor) means it is not —
+	// defer to the bd-walk, which reads closed intermediates too.
+	if r.hasDangling {
+		return storeHasOpenDescendants(r.store, rootID)
 	}
 	return false, nil
 }
