@@ -9,6 +9,8 @@ tiers); fixes land on per-bug branches. Verified against `origin/main` (this bra
 |---|---|---|
 | `codex-reasoning-effort` | forward Codex reasoning effort (`gc.reasoning` → `-c model_reasoning_effort`) | — |
 | `fix-hook-projection-dedup` | dedup hook entries on overlay merge (matcherless `{hooks:[…]}` shape) | `bh-hm6` |
+| `fix-2954-watcher-ignore` ✓ | prune `node_modules`/`.git`/… from the recursive config watcher (kqueue FD leak) — **#2954** (Claude) | — |
+| `fix-2893-dispatch-bfs` ✓ | cache-served in-memory descendant walk, kill per-node `bd` BFS — **#2893** (Claude) | — |
 
 ## Incident-correlated bugs (first-hand data from incident `bh-wisp-l4base`)
 We just resolved a HIGH town outage — supervisor FD exhaustion (245k FDs) → EMFILE → wedged supervisor
@@ -50,10 +52,18 @@ single-flight re-dispatch guards. **M / Medium.** First PR *with strong tests* (
 warm; open-grandchild-under-closed-child → true; orphan-all-closed → false; cache-miss fallback).
 → **dispatch to Claude** (correctness-sensitive).
 
-### #2984 (P2) — `gc supervisor status` reports not-running while healthy  ·  **TO INVESTIGATE (Codex)**
-Our incident showed the exact split: `status` read the pidfile (said "running") while `reload`/`stop`
-hit the dead socket (said "not running") under FD exhaustion. Likely a pidfile-vs-socket health-check
-inconsistency.
+### #2984 (P2) — `gc supervisor status` reports not-running while healthy  ·  **INVESTIGATED (Codex) — FIX CANDIDATE #3**
+**Root cause (Codex, read-only):** `supervisorStatusWithOptions` (`cmd/gc/cmd_supervisor.go:771`) decides
+"running" SOLELY from `runningSupervisorSocket()` (`:574`) — a unix-socket dial+ping; any dial failure ⇒
+"not running". It never consults launchd/systemd, even though `supervisorLaunchdActive`
+(`cmd/gc/cmd_supervisor_lifecycle.go:44`, parsing `launchctl print` `state = running`) already exists and
+is used in the uninstall guard (`:1602`) to distinguish "launchd active + socket unavailable". So a
+launchd-healthy supervisor with a dead/unreachable socket is mislabeled not-running. (Codex confirms the
+pidfile/socket split from our incident is NOT in `main` — that was `gc 1.2.1`.)
+**Fix:** a canonical health helper → `{socket_reachable, platform_service_active, overall_running}`;
+`status` reports running if the socket responds OR launchd/systemd is active (degraded/running-without-control);
+`reload`/`stop` keep requiring the socket but message "alive but control socket unavailable", not "not running".
+**S / Risk M** (user-visible status text/exit codes — keep narrow). First-PR candidate: **yes** → next.
 
 ### #2958 (P1, accepted) — `gc sling` success on suspended rig; work stalls  ·  **TO INVESTIGATE**
 Our incident hot-looped on suspended rigs.
